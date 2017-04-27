@@ -982,7 +982,7 @@ class Connection(object):
         """Read an entire "mysql packet" in its entirety from the network
         and return a MysqlPacket type that represents the results.
         """
-        buff = b''
+        buff = bytearray()
         while True:
             packet_header = self._read_bytes(4)
             if DEBUG: dump_packet(packet_header)
@@ -1003,7 +1003,7 @@ class Connection(object):
 
             recv_data = self._read_bytes(bytes_to_read)
             if DEBUG: dump_packet(recv_data)
-            buff += recv_data
+            buff.extend(recv_data)
             # https://dev.mysql.com/doc/internals/en/sending-more-than-16mbyte.html
             if bytes_to_read == 0xffffff:
                 continue
