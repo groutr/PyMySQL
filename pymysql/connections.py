@@ -24,6 +24,7 @@ from .cursors import Cursor
 from .optionfile import Parser
 from .util import byte2int, int2byte
 from . import err
+from . import parser
 
 try:
     import ssl
@@ -984,6 +985,36 @@ class Connection(object):
         self._write_bytes(data)
         self._next_seq_id = (self._next_seq_id + 1) % 256
 
+    def _read_single_packet(self):
+        packet_header = self._read_bytes(4)
+        btrl, btrh, packet_number = struct.unpack('<HBB', packet_header)
+        bytes_to_read = btrl + (btrh << 16)
+
+        if packet_number != self._next_seq_id:
+            self._force_close()
+            if packet_number == 0:
+                # MariaDB sends error packet with seqno==0 when shutdown
+                raise err.OperationalError(
+                    CR.CR_SERVER_LOST,
+                    "Lost connection to MySQL server during query")
+            raise err.InternalError(
+                "Packet sequence number wrong - got %d expected %d"
+                % (packet_number, self._next_seq_id))
+        self._next_seq_id = (self._next_seq_id + 1) % 256
+
+        recv_data = self._read_bytes(bytes_to_read)
+        if DEBUG: dump_packet(recv_data)
+        result = Packet(bytes_to_read, packet_number, recv_data)
+        parser.check_error(result)
+        return result
+
+    def _yield_packets(self):
+        size = 0
+        while size < MAX_PACKET_LEN:
+            packet = self._read_single_packet()
+            size = packet.size
+            yield packet
+
     def _read_packet(self, packet_type=MysqlPacket):
         """Read an entire "mysql packet" in its entirety from the network
         and return a MysqlPacket type that represents the results.
@@ -1348,11 +1379,11 @@ class MySQLResult(object):
 
     def read(self):
         try:
-            first_packet = self.connection._read_packet()
+            first_packet = self.connection._read_single_packet()
 
-            if first_packet.is_ok_packet():
+            if parser.is_ok_packet(first_packet):
                 self._read_ok_packet(first_packet)
-            elif first_packet.is_load_local_packet():
+            elif parser.is_load_local(first_packet):
                 self._read_load_local_packet(first_packet)
             else:
                 self._read_result_packet(first_packet)
@@ -1361,18 +1392,18 @@ class MySQLResult(object):
 
     def init_unbuffered_query(self):
         self.unbuffered_active = True
-        first_packet = self.connection._read_packet()
+        first_packet = self.connection._read_single_packet()
 
-        if first_packet.is_ok_packet():
+        if parser.is_ok_packet(first_packet):
             self._read_ok_packet(first_packet)
             self.unbuffered_active = False
             self.connection = None
-        elif first_packet.is_load_local_packet():
+        elif parser.is_load_local(first_packet):
             self._read_load_local_packet(first_packet)
             self.unbuffered_active = False
             self.connection = None
         else:
-            self.field_count = first_packet.read_length_encoded_integer()
+            _, self.field_count = parser.read_length_encoded_integer(first_packet.payload)
             self._get_descriptions()
 
             # Apparently, MySQLdb picks this number because it's the maximum
@@ -1380,14 +1411,9 @@ class MySQLResult(object):
             # we set it to this instead of None, which would be preferred.
             self.affected_rows = 18446744073709551615
 
-    def _read_ok_packet(self, first_packet):
-        ok_packet = OKPacketWrapper(first_packet)
-        self.affected_rows = ok_packet.affected_rows
-        self.insert_id = ok_packet.insert_id
-        self.server_status = ok_packet.server_status
-        self.warning_count = ok_packet.warning_count
-        self.message = ok_packet.message
-        self.has_next = ok_packet.has_next
+    def _read_ok_packet(self, packet):
+        ok_packet = parser.parse_ok_packet(packet)
+        self.__dict__.update(ok_packet)
 
     def _read_load_local_packet(self, first_packet):
         if not self.connection._local_infile:
@@ -1407,21 +1433,32 @@ class MySQLResult(object):
         self._read_ok_packet(ok_packet)
 
     def _check_packet_is_eof(self, packet):
-        if not packet.is_eof_packet():
-            return False
         #TODO: Support CLIENT.DEPRECATE_EOF
         # 1) Add DEPRECATE_EOF to CAPABILITIES
         # 2) Mask CAPABILITIES with server_capabilities
-        # 3) if server_capabilities & CLIENT.DEPRECATE_EOF: use OKPacketWrapper instead of EOFPacketWrapper
-        wp = EOFPacketWrapper(packet)
-        self.warning_count = wp.warning_count
-        self.has_next = wp.has_next
-        return True
+        # 3) if server_capabilities & CLIENT_DEPRECATE_EOF: check for ok packet instead of eof packet
+        try:
+            eof = parser.parse_eof_packet(packet)
+            self.warning_count = eof['warning_count']
+            self.has_next = eof['has_next']
+            return True
+        except parser.InvalidPacketError:
+            return False
 
     def _read_result_packet(self, first_packet):
-        self.field_count = first_packet.read_length_encoded_integer()
-        self._get_descriptions()
-        self._read_rowdata_packet()
+        packet_stream = self.connection._yield_packets()
+        try:
+            result_it = parser.parse_result_stream(packet_stream, encoding=self.connection.encoding)
+            self.fields = next(result_it)
+            self.field_count = len(self.fields)
+            self.description = tuple(f['description'] for f in self.fields)
+            self.rows = tuple(result_it)
+        except parser.InvalidPacketError:
+            raise ValueError("Something very wrong happened")
+
+        #self.field_count = first_packet.read_length_encoded_integer()
+        #self._get_descriptions()
+        #self._read_rowdata_packet()
 
     def _read_rowdata_packet_unbuffered(self):
         # Check if in an active query
