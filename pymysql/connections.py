@@ -15,6 +15,7 @@ import struct
 import sys
 import traceback
 import warnings
+from collections import namedtuple
 
 from .charset import MBLENGTH, charset_by_name, charset_by_id
 from .constants import CLIENT, COMMAND, CR, FIELD_TYPE, SERVER_STATUS
@@ -95,6 +96,7 @@ DEFAULT_CHARSET = 'latin1'
 
 MAX_PACKET_LEN = 2**24-1
 
+Packet = namedtuple('Packet', ['size', 'seq_id', 'payload'])
 
 def dump_packet(data): # pragma: no cover
     def is_ascii(data):
