@@ -34,8 +34,8 @@ except (ImportError, KeyError):
 
 DEBUG = False
 
-if sys.version.major == 3:
-    if sys.version.minor < 6:
+if sys.version_info.major == 3:
+    if sys.version_info.minor < 6:
         # See http://bugs.python.org/issue24870
         _surrogateescape_table = [chr(i) if i < 0x80 else chr(i + 0xdc00) for i in range(256)]
 
@@ -90,9 +90,9 @@ DEFAULT_CHARSET = 'latin1'
 
 MAX_PACKET_LEN = 2**24-1
 
-FIELD_LEN = {
-    'uint8'
-}
+class InvalidPacketError(Exception):
+    pass
+
 def dump_packet(data): # pragma: no cover
     def is_ascii(data):
         if 65 <= byte2int(data) <= 122:
@@ -172,7 +172,7 @@ def read_length_encoded_integer(data, offset=0):
 def read_length_coded_string(data, offset=0):
     size, length = read_length_encoded_integer(data, offset=offset)
     if length:
-        return size + length, read(data, length, offset=offset)
+        return size + length, read(data, length, offset=offset+size)
 
 def read_string(data, offset=0):
     end = data.find(b'\0', offset)
@@ -206,6 +206,9 @@ def check_error(packet):
         err.raise_mysql_exception(packet.payload)
 
 def parse_ok_packet(packet):
+    if not is_ok_packet(packet):
+        raise InvalidPacketError()
+
     pos = 1
     data = packet.payload
 
@@ -218,10 +221,10 @@ def parse_ok_packet(packet):
     server_status, warning_count = struct.unpack_from('<HH', data, offset=pos)
     pos += 4
 
+    # Read the rest of the packet
     message = read(data, None, offset=pos)
-    pos += len(message)
+    #pos += len(message)
 
-    assert pos == packet.size
     return {'affected_rows': affected_rows,
             'insert_id': insert_id,
             'server_status': server_status,
@@ -230,6 +233,9 @@ def parse_ok_packet(packet):
             'has_next': server_status & SERVER_STATUS.SERVER_MORE_RESULTS_EXISTS}
 
 def parse_eof_packet(packet):
+    if not is_eof_packet(packet):
+        raise InvalidPacketError()
+
     pos = 1
     data = packet.payload
 
@@ -301,36 +307,81 @@ def parse_field_descriptor_packet(packet, encoding=DEFAULT_CHARSET):
     return result
 
 
-
-def parse_packet(packet, encoding=DEFAULT_CHARSET):
+def parse_result_stream(stream, encoding=DEFAULT_CHARSET, use_unicode=False,
+                        converters=None):
     """
-    Parse packets into a resultset
+    Parse stream of packets in a result stream.
     Args:
-        packet (PACKET): packet
-        unbuffered (bool): buffer result client-side
+        stream:
+        encoding:
 
     Returns:
-        tuple: rows
+        (iterator):
+            0: Field descriptions
+            1: Groups of rows (each packet)
     """
-    position = 0
-    data = packet.payload
+    first = next(stream)
+    _, field_count = read_length_encoded_integer(first.payload)
 
-    # Get fields and descriptions
-    size, field_count = read_length_encoded_integer(data)
-    position += size
+    # the next field_count packets are field descriptor packets.
+    fields = [None] * field_count
+    f_encodings = [None] * field_count
+    f_converters = [None] * field_count
+    for i in range_type(field_count):
+        p = next(stream)
+        fields[i] = field = parse_field_descriptor_packet(p, encoding=encoding)
+        field_type = field['field_type']
+        if use_unicode:
+            if field['charsetnr'] == 63 and field_type in TEXT_TYPES:
+                # TEXTs with charset=binary means BINARY types
+                encoding = None
+            elif field_type == FIELD_TYPE.JSON or field_type in TEXT_TYPES:
+                # When SELECT from JSON column: charset = binary
+                # When SELECT CAST(... AS JSON): charset = connection encoding
+                # This behavior is different from TEXT / BLOB.
+                # We should decode result by connection encoding regardless charsetnr.
+                # See https://github.com/PyMySQL/PyMySQL/issues/488
+                encoding = encoding  # SELECT CAST(... AS JSON)
+            else:
+                encoding = 'ascii'
+        else:
+            encoding = None
+        f_encodings[i] = encoding
 
-    fields = []
-    converters = []
-    for f in range_type(field_count):
-        field = parse_field()
-        fields.append(field)
-        field_type = field.type
+        converter = converters.get(field_type)
+        if converter is converters.through:
+            converter = None
+        field['converter'] = converter
+        f_converters[i] = converter
+        if DEBUG: print("DEBUG: field={}, converter={}".format(field, converter))
 
+    # Expect an EOF packet
+    if not is_eof_packet(next(stream)):
+        raise InvalidPacketError
 
-    # Read the row data
-    rows = []
-    while pos
+    # Yield the descriptions
+    yield tuple(fields)
 
+    # Rest of the packets contain rows (1 packet == 1 row)
+    # Parsing of packets
+    #rows = []
+    curr_packet = next(stream)
+    while not is_eof_packet(curr_packet):
+        position = 0
+        row = [None] * field_count
+        i = 0
+        while position < curr_packet.size:
+            size, data = read_length_coded_string(curr_packet.payload, offset=position)
+            position += size
 
-
-
+            if data is not None:
+                if f_encodings[i]:
+                    data = data.decode(f_encodings[i])
+                if DEBUG: print("DEBUG: DATA = ", data)
+                if f_converters[i]:
+                    data = f_converters[i](data)
+            row[i] = data
+            i += 1
+        assert len(row) == field_count
+        yield tuple(row)
+        curr_packet = next(stream)
