@@ -1008,13 +1008,6 @@ class Connection(object):
         parser.check_error(result)
         return result
 
-    def _yield_packets(self):
-        size = 0
-        while size < MAX_PACKET_LEN:
-            packet = self._read_single_packet()
-            size = packet.size
-            yield packet
-
     def _read_packet(self, packet_type=MysqlPacket):
         """Read an entire "mysql packet" in its entirety from the network
         and return a MysqlPacket type that represents the results.
@@ -1446,10 +1439,27 @@ class MySQLResult(object):
             return False
 
     def _read_result_packet(self, first_packet):
-        packet_stream = self.connection._yield_packets()
+        def _iter_result_packets():
+            # Field count
+            yield first_packet
+
+            # Field packets
+            packet = self.connection._read_single_packet()
+            while not parser.is_eof_packet(packet):
+                yield packet
+                packet = self.connection._read_single_packet()
+
+            # Row data packets
+            packet = self.connection._read_single_packet()
+            while not parser.is_eof_packet(packet):
+                yield packet
+                packet = self.connection._read_single_packet()
+            
+
         try:
-            result_it = parser.parse_result_stream(packet_stream, encoding=self.connection.encoding)
+            result_it = parser.parse_result_stream(_iter_result_packets(), encoding=self.connection.encoding)
             self.fields = next(result_it)
+
             self.field_count = len(self.fields)
             self.description = tuple(f['description'] for f in self.fields)
             self.rows = tuple(result_it)
