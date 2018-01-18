@@ -11,7 +11,7 @@ import struct
 import sys
 
 from .constants import FIELD_TYPE, SERVER_STATUS
-from . import converters
+from . import converters as _converters
 from .cursors import Cursor
 from .optionfile import Parser
 from .util import byte2int, int2byte
@@ -132,15 +132,16 @@ read_uint64 = partial(struct.unpack_from, '<Q')
 
 def read(data, nbytes, offset=0):
     if nbytes is None:
-        result = data[offset:]
+        # nbytes == len(result) by definition
+        return data[offset:]
     else:
         result = data[offset:offset+nbytes]
 
-    if len(result) == nbytes:
-        return result
-    else:
+        if len(result) == nbytes:
+            return result
+
         error = ('Result length not requested length:\n'
-                 'Expected=%s.  Actual=%s.  Position: %s.  Data Length: %s'
+                 'Expected=%s  Actual=%s  Position: %s  Data Length: %s'
                  % (nbytes, len(result), offset, len(data)))
         if DEBUG:
             print(error)
@@ -172,7 +173,13 @@ def read_length_encoded_integer(data, offset=0):
 def read_length_coded_string(data, offset=0):
     size, length = read_length_encoded_integer(data, offset=offset)
     if length:
-        return size + length, read(data, length, offset=offset+size)
+        try:
+            return size + length, read(data, length, offset=offset+size)
+        except AssertionError as exc:
+            print("[read_length_coded_string] Size={}, length={}, offset={}".format(size, length, offset))
+            print(data)
+            raise
+    return size, None
 
 def read_string(data, offset=0):
     end = data.find(b'\0', offset)
@@ -209,7 +216,7 @@ def parse_ok_packet(packet):
     if not is_ok_packet(packet):
         raise InvalidPacketError()
 
-    pos = 1
+    pos = 0
     data = packet.payload
 
     size, affected_rows = read_length_encoded_integer(data, offset=pos)
@@ -236,7 +243,7 @@ def parse_eof_packet(packet):
     if not is_eof_packet(packet):
         raise InvalidPacketError()
 
-    pos = 1
+    pos = 0
     data = packet.payload
 
     warning_count, server_status = struct.unpack_from('<hh', data, offset=pos)
@@ -248,7 +255,7 @@ def parse_eof_packet(packet):
             'has_next': server_status & SERVER_STATUS.SERVER_MORE_RESULTS_EXISTS}
 
 def parse_load_local_packet(packet):
-    pos = 1
+    pos = 0
     data = packet.payload
 
     filename = read(data, None, offset=pos)
@@ -260,7 +267,7 @@ def parse_field_descriptor_packet(packet, encoding=DEFAULT_CHARSET):
     pos = 0
     data = packet.payload
 
-    size, catalog = read_length_encoded_integer(data, offset=pos)
+    size, catalog = read_length_coded_string(data, offset=pos)
     pos += size
 
     size, db = read_length_coded_string(data, offset=pos)
@@ -281,12 +288,18 @@ def parse_field_descriptor_packet(packet, encoding=DEFAULT_CHARSET):
     pos += 1
     charsetnr, length, type_code, flags, scale = struct.unpack_from('<HIBHB', data, offset=pos)
 
-    result =  {'catalog': catalog,
+    if encoding:
+        table_name = table_name.decode(encoding)
+        org_table = org_table.decode(encoding)
+        name = name.decode(encoding)
+        org_name = org_name.decode(encoding)
+
+    result = {'catalog': catalog,
             'db': db,
-            'table_name': table_name.decode(encoding),
-            'org_table': org_table.decode(encoding),
-            'name': name.decode(encoding),
-            'org_name': org_name.decode(encoding),
+            'table_name': table_name,
+            'org_table': org_table,
+            'name': name,
+            'org_name': org_name,
             'charsetnr': charsetnr,
             'length': length,
             'type_code': type_code,
@@ -320,17 +333,19 @@ def parse_result_stream(stream, encoding=DEFAULT_CHARSET, use_unicode=False,
             0: Field descriptions
             1: Groups of rows (each packet)
     """
-    first = next(stream)
-    _, field_count = read_length_encoded_integer(first.payload)
+    curr_packet = next(stream)
+    _, field_count = read_length_encoded_integer(curr_packet.payload)
 
     # the next field_count packets are field descriptor packets.
+    if converters is None:
+        converters = _converters.decoders
     fields = [None] * field_count
     f_encodings = [None] * field_count
     f_converters = [None] * field_count
     for i in range_type(field_count):
-        p = next(stream)
-        fields[i] = field = parse_field_descriptor_packet(p, encoding=encoding)
-        field_type = field['field_type']
+        curr_packet = next(stream)
+        fields[i] = field = parse_field_descriptor_packet(curr_packet, encoding=encoding)
+        field_type = field['type_code']
         if use_unicode:
             if field['charsetnr'] == 63 and field_type in TEXT_TYPES:
                 # TEXTs with charset=binary means BINARY types
@@ -349,28 +364,23 @@ def parse_result_stream(stream, encoding=DEFAULT_CHARSET, use_unicode=False,
         f_encodings[i] = encoding
 
         converter = converters.get(field_type)
-        if converter is converters.through:
+        if converter is _converters.through:
             converter = None
         field['converter'] = converter
         f_converters[i] = converter
         if DEBUG: print("DEBUG: field={}, converter={}".format(field, converter))
-
-    # Expect an EOF packet
-    if not is_eof_packet(next(stream)):
-        raise InvalidPacketError
 
     # Yield the descriptions
     yield tuple(fields)
 
     # Rest of the packets contain rows (1 packet == 1 row)
     # Parsing of packets
-    #rows = []
-    curr_packet = next(stream)
-    while not is_eof_packet(curr_packet):
+    row = [None] * field_count
+    for curr_packet in stream:
         position = 0
-        row = [None] * field_count
+        #row = [None] * field_count
         i = 0
-        while position < curr_packet.size:
+        while i < field_count:
             size, data = read_length_coded_string(curr_packet.payload, offset=position)
             position += size
 
@@ -384,4 +394,3 @@ def parse_result_stream(stream, encoding=DEFAULT_CHARSET, use_unicode=False,
             i += 1
         assert len(row) == field_count
         yield tuple(row)
-        curr_packet = next(stream)
