@@ -760,12 +760,12 @@ class Connection(object):
                     SERVER_STATUS.SERVER_STATUS_AUTOCOMMIT)
 
     def _read_ok_packet(self):
-        pkt = self._read_packet()
-        if not pkt.is_ok_packet():
+        pkt = self._read_single_packet()
+        try:
+            ok = parser.parse_ok_packet(pkt)
+            self.server_status = ok['server_status']
+        except parser.InvalidPacketError:
             raise err.OperationalError(2014, "Command Out of Sync")
-        ok = OKPacketWrapper(pkt)
-        self.server_status = ok.server_status
-        return ok
 
     def _send_autocommit_mode(self):
         """Set whether or not to commit after every execute()"""
@@ -873,7 +873,8 @@ class Connection(object):
     def kill(self, thread_id):
         arg = struct.pack('<I', thread_id)
         self._execute_command(COMMAND.COM_PROCESS_KILL, arg)
-        return self._read_ok_packet()
+        self._read_ok_packet()
+        #return self._read_ok_packet()
 
     def ping(self, reconnect=True):
         """Check if the server is alive"""
@@ -1008,41 +1009,41 @@ class Connection(object):
         parser.check_error(result)
         return result
 
-    def _read_packet(self, packet_type=MysqlPacket):
-        """Read an entire "mysql packet" in its entirety from the network
-        and return a MysqlPacket type that represents the results.
-        """
-        buff = b''
-        while True:
-            packet_header = self._read_bytes(4)
-            #if DEBUG: dump_packet(packet_header)
-
-            btrl, btrh, packet_number = struct.unpack('<HBB', packet_header)
-            bytes_to_read = btrl + (btrh << 16)
-            if packet_number != self._next_seq_id:
-                self._force_close()
-                if packet_number == 0:
-                    # MariaDB sends error packet with seqno==0 when shutdown
-                    raise err.OperationalError(
-                        CR.CR_SERVER_LOST,
-                        "Lost connection to MySQL server during query")
-                raise err.InternalError(
-                    "Packet sequence number wrong - got %d expected %d"
-                    % (packet_number, self._next_seq_id))
-            self._next_seq_id = (self._next_seq_id + 1) % 256
-
-            recv_data = self._read_bytes(bytes_to_read)
-            if DEBUG: dump_packet(recv_data)
-            buff += recv_data
-            # https://dev.mysql.com/doc/internals/en/sending-more-than-16mbyte.html
-            if bytes_to_read == 0xffffff:
-                continue
-            if bytes_to_read < MAX_PACKET_LEN:
-                break
-
-        packet = packet_type(buff, self.encoding)
-        packet.check_error()
-        return packet
+    # def _read_packet(self, packet_type=MysqlPacket):
+    #     """Read an entire "mysql packet" in its entirety from the network
+    #     and return a MysqlPacket type that represents the results.
+    #     """
+    #     buff = b''
+    #     while True:
+    #         packet_header = self._read_bytes(4)
+    #         #if DEBUG: dump_packet(packet_header)
+    #
+    #         btrl, btrh, packet_number = struct.unpack('<HBB', packet_header)
+    #         bytes_to_read = btrl + (btrh << 16)
+    #         if packet_number != self._next_seq_id:
+    #             self._force_close()
+    #             if packet_number == 0:
+    #                 # MariaDB sends error packet with seqno==0 when shutdown
+    #                 raise err.OperationalError(
+    #                     CR.CR_SERVER_LOST,
+    #                     "Lost connection to MySQL server during query")
+    #             raise err.InternalError(
+    #                 "Packet sequence number wrong - got %d expected %d"
+    #                 % (packet_number, self._next_seq_id))
+    #         self._next_seq_id = (self._next_seq_id + 1) % 256
+    #
+    #         recv_data = self._read_bytes(bytes_to_read)
+    #         if DEBUG: dump_packet(recv_data)
+    #         buff += recv_data
+    #         # https://dev.mysql.com/doc/internals/en/sending-more-than-16mbyte.html
+    #         if bytes_to_read == 0xffffff:
+    #             continue
+    #         if bytes_to_read < MAX_PACKET_LEN:
+    #             break
+    #
+    #     packet = packet_type(buff, self.encoding)
+    #     packet.check_error()
+    #     return packet
 
     def _read_bytes(self, num_bytes):
         self._sock.settimeout(self._read_timeout)
@@ -1179,21 +1180,21 @@ class Connection(object):
             data += name + b'\0'
 
         self.write_packet(data)
-        auth_packet = self._read_packet()
+        auth_packet = self._read_single_packet()
 
         # if authentication method isn't accepted the first byte
         # will have the octet 254
-        if auth_packet.is_auth_switch_request():
+        if parser.is_auth_switch_request(auth_packet):
             # https://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::AuthSwitchRequest
-            auth_packet.read_uint8() # 0xfe packet identifier
-            plugin_name = auth_packet.read_string()
+            #auth_packet.read_uint8() # 0xfe packet identifier
+            plugin_name = parser.read_string(auth_packet.payload, offset=1)
             if self.server_capabilities & CLIENT.PLUGIN_AUTH and plugin_name is not None:
                 auth_packet = self._process_auth(plugin_name, auth_packet)
             else:
                 # send legacy handshake
                 data = _scramble_323(self.password.encode('latin1'), self.salt) + b'\0'
                 self.write_packet(data)
-                auth_packet = self._read_packet()
+                auth_packet = self._read_single_packet()
 
     def _process_auth(self, plugin_name, auth_packet):
         plugin_class = self._auth_plugin_map.get(plugin_name)
@@ -1272,8 +1273,8 @@ class Connection(object):
 
     def _get_server_information(self):
         i = 0
-        packet = self._read_packet()
-        data = packet.get_all_data()
+        packet = self._read_single_packet()
+        data = packet.payload
 
         self.protocol_version = byte2int(data[i:i+1])
         i += 1
