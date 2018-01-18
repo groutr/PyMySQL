@@ -1370,6 +1370,28 @@ class MySQLResult(object):
         if self.unbuffered_active:
             self._finish_unbuffered_query()
 
+    def _iter_result_packets(self, first_packet):
+        # Field count
+        yield first_packet
+
+        # Field packets
+        packet = self.connection._read_single_packet()
+        while not parser.is_eof_packet(packet):
+            yield packet
+            packet = self.connection._read_single_packet()
+
+        # EOF Packet
+        self._check_packet_is_eof(packet)
+
+        # Row data packets
+        packet = self.connection._read_single_packet()
+        while not parser.is_eof_packet(packet):
+            yield packet
+            packet = self.connection._read_single_packet()
+
+        # EOF Packet
+        self._check_packet_is_eof(packet)
+
     def read(self):
         try:
             first_packet = self.connection._read_single_packet()
@@ -1396,13 +1418,14 @@ class MySQLResult(object):
             self.unbuffered_active = False
             self.connection = None
         else:
-            _, self.field_count = parser.read_length_encoded_integer(first_packet.payload)
-            self._get_descriptions()
-
             # Apparently, MySQLdb picks this number because it's the maximum
             # value of a 64bit unsigned integer. Since we're emulating MySQLdb,
             # we set it to this instead of None, which would be preferred.
             self.affected_rows = 18446744073709551615
+            self._unbuffered_rows = self._iter_result_rows(first_packet)
+
+            #_, self.field_count = parser.read_length_encoded_integer(first_packet.payload)
+            #self._get_descriptions()
 
     def _read_ok_packet(self, packet):
         ok_packet = parser.parse_ok_packet(packet)
@@ -1438,62 +1461,49 @@ class MySQLResult(object):
         except parser.InvalidPacketError:
             return False
 
-    def _read_result_packet(self, first_packet):
-        def _iter_result_packets():
-            # Field count
-            yield first_packet
+    def _iter_result_rows(self, first_packet):
+        packet_stream = self._iter_result_packets(first_packet)
+        result_it = parser.parse_result_stream(packet_stream, encoding=self.connection.encoding,
+                                               use_unicode=self.connection.use_unicode,
+                                               converters=self.connection.decoders)
+        self.fields = next(result_it)
 
-            # Field packets
-            packet = self.connection._read_single_packet()
-            while not parser.is_eof_packet(packet):
-                yield packet
-                packet = self.connection._read_single_packet()
+        self.field_count = len(self.fields)
+        self.description = tuple(f['description'] for f in self.fields)
 
-            # Row data packets
-            packet = self.connection._read_single_packet()
-            while not parser.is_eof_packet(packet):
-                yield packet
-                packet = self.connection._read_single_packet()
-            
-
-        try:
-            result_it = parser.parse_result_stream(_iter_result_packets(), encoding=self.connection.encoding)
-            self.fields = next(result_it)
-
-            self.field_count = len(self.fields)
-            self.description = tuple(f['description'] for f in self.fields)
-            self.rows = tuple(result_it)
-        except parser.InvalidPacketError:
-            raise ValueError("Something very wrong happened")
+        for next_row in result_it:
+            yield next_row
 
         #self.field_count = first_packet.read_length_encoded_integer()
         #self._get_descriptions()
         #self._read_rowdata_packet()
+
+    def _read_result_packet(self, first_packet):
+        self.rows = tuple(self._iter_result_rows(first_packet))
 
     def _read_rowdata_packet_unbuffered(self):
         # Check if in an active query
         if not self.unbuffered_active:
             return
 
-        # EOF
-        packet = self.connection._read_packet()
-        if self._check_packet_is_eof(packet):
+        try:
+            row = next(self._unbuffered_rows)
+            self.affected_rows = 1
+            self.rows = (row,)  # rows should tuple of row for MySQL-python compatibility.
+            return row
+        except StopIteration:
             self.unbuffered_active = False
+            self._unbuffered_rows = None
             self.connection = None
             self.rows = None
             return
-
-        row = self._read_row_from_packet(packet)
-        self.affected_rows = 1
-        self.rows = (row,)  # rows should tuple of row for MySQL-python compatibility.
-        return row
 
     def _finish_unbuffered_query(self):
         # After much reading on the MySQL protocol, it appears that there is,
         # in fact, no way to stop MySQL from sending all the data after
         # executing a query, so we just spin, and wait for an EOF packet.
         while self.unbuffered_active:
-            packet = self.connection._read_packet()
+            packet = self.connection._read_single_packet()
             if self._check_packet_is_eof(packet):
                 self.unbuffered_active = False
                 self.connection = None  # release reference to kill cyclic reference.
