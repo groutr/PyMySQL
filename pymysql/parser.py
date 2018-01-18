@@ -7,7 +7,7 @@ from functools import partial
 from collections import namedtuple
 import operator
 import io
-import struct
+from struct import unpack_from
 import sys
 
 from .constants import FIELD_TYPE, SERVER_STATUS
@@ -125,10 +125,19 @@ else:
     def read_uint8(data, offset=0):
         return data[offset]
 
-read_uint16 = partial(struct.unpack_from, '<H')
-read_uint24 = partial(struct.unpack_from, '<HB')
-read_uint32 = partial(struct.unpack_from, '<I')
-read_uint64 = partial(struct.unpack_from, '<Q')
+
+def read_uint16(data, offset=0):
+    return unpack_from('<H', data, offset)[0]
+
+def read_uint24(data, offset=0):
+    return unpack_from('<HB', data, offset)[0]
+
+def read_uint32(data, offset=0):
+    return unpack_from('<I', data, offset)[0]
+
+def read_uint64(data, offset=0):
+    return unpack_from('<Q', data, offset)[0]
+
 
 def read(data, nbytes, offset=0):
     if nbytes is None:
@@ -172,14 +181,10 @@ def read_length_encoded_integer(data, offset=0):
 
 def read_length_coded_string(data, offset=0):
     size, length = read_length_encoded_integer(data, offset=offset)
-    if length:
-        try:
-            return size + length, read(data, length, offset=offset+size)
-        except AssertionError as exc:
-            print("[read_length_coded_string] Size={}, length={}, offset={}".format(size, length, offset))
-            print(data)
-            raise
-    return size, None
+    if length is None:
+        return size, None
+    return size + length, read(data, length, offset=offset+size)
+
 
 def read_string(data, offset=0):
     end = data.find(b'\0', offset)
@@ -225,7 +230,7 @@ def parse_ok_packet(packet):
     size, insert_id = read_length_encoded_integer(data, offset=pos)
     pos += size
 
-    server_status, warning_count = struct.unpack_from('<HH', data, offset=pos)
+    server_status, warning_count = unpack_from('<HH', data, offset=pos)
     pos += 4
 
     # Read the rest of the packet
@@ -246,7 +251,7 @@ def parse_eof_packet(packet):
     pos = 0
     data = packet.payload
 
-    warning_count, server_status = struct.unpack_from('<hh', data, offset=pos)
+    warning_count, server_status = unpack_from('<hh', data, offset=pos)
     pos += 4
 
     if DEBUG: print("server_status=", server_status)
@@ -286,7 +291,7 @@ def parse_field_descriptor_packet(packet, encoding=DEFAULT_CHARSET):
     pos += size
 
     pos += 1
-    charsetnr, length, type_code, flags, scale = struct.unpack_from('<HIBHB', data, offset=pos)
+    charsetnr, length, type_code, flags, scale = unpack_from('<HIBHB', data, offset=pos)
 
     if encoding:
         table_name = table_name.decode(encoding)
